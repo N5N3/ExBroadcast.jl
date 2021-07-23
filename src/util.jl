@@ -22,10 +22,10 @@ end
 
 ### import many funtions
 import Base.Broadcast: throwdm, AbstractArrayStyle, Unknown, combine_eltypes,
-    preprocess, Broadcasted, DefaultArrayStyle, ischunkedbroadcast, chunkedcopyto!, bitcache_size, 
-    dumpbitcache, bitcache_chunks, materialize!, BroadcastStyle, combine_styles, instantiate, 
+    preprocess, Broadcasted, DefaultArrayStyle, ischunkedbroadcast, chunkedcopyto!, bitcache_size,
+    dumpbitcache, bitcache_chunks, materialize!, BroadcastStyle, combine_styles, instantiate,
     broadcastable, broadcast_unalias, Style, _broadcast_getindex, broadcasted
-import Base: size, axes, setindex!, unalias, mightalias, unaliascopy, IndexStyle, parent, 
+import Base: size, axes, setindex!, unalias, mightalias, unaliascopy, IndexStyle, parent,
     unsafe_setindex!, copyto!, IndexStyle, tail
 const FilledBC = Broadcasted{<:AbstractArrayStyle{0}}
 """
@@ -78,6 +78,8 @@ module LazyCollect
 import Base: @propagate_inbounds, getindex
 import Base.Broadcast: BroadcastStyle, broadcastable, extrude, newindex, broadcasted,
     instantiate, Broadcasted, DefaultArrayStyle
+import Base.Iterators: ProductIterator
+
 export Lazy
 
 @inline ndims(x) = x isa Tuple ? 1 : Base.ndims(x)
@@ -87,27 +89,27 @@ struct FakeDim{N,S,T,D} <: AbstractArray{T,N}
     data::D
     FakeDim{N,S}(data::T) where {N,S,T} = new{N,S,eltype(data),T}(data)
 end
-FakeDim{AD}(data) where {AD} = AD == 0 ? data : FakeDim{AD + ndims(data),AD + 1}(data)
-FakeDim{AD}(data::AbstractArray{T,0}) where {AD,T} = data
-FakeDim{AD}(data::Ref{T}) where {AD,T} = data
-FakeDim{AD}(data::Tuple{Any}) where {AD} = data
-FakeDim{AD}(data::Number) where {AD} = data
-FakeDim{AD}(id::FakeDim{N,S}) where {N,S,AD} = FakeDim{AD + N,AD + S}(id.data)
-FakeDim{AD}(bc::Broadcasted) where {AD} = broadcasted(bc.f, FakeDim{AD}.(bc.args)...)
+@inline FakeDim{AD}(data::AbstractArray{<:Any,0}) where {AD} = data
+@inline FakeDim{AD}(data::Ref{<:Any}) where {AD} = data
+@inline FakeDim{AD}(data::Tuple{Any}) where {AD} = data
+@inline FakeDim{AD}(data::Number) where {AD} = data
+@inline FakeDim{AD}(id::FakeDim{N,S}) where {N,S,AD} = FakeDim{AD + N,AD + S}(id.data)
+@inline FakeDim{AD}(bc::Broadcasted{S}) where {AD,S} = Broadcasted{S}(bc.f, FakeDim{AD}.(bc.args)...) |> instantiate
+@inline FakeDim{AD}(data) where {AD} = let data = lazy(data)
+    iszero(AD) ? data : FakeDim{AD + ndims(data),AD + 1}(data)
+end
+@inline FakeDim{AD}(x, y, args...) where {AD} =
+    (FakeDim{AD}(x), FakeDim{AD + ndims(x)}(y, args...)...)
+@inline FakeDim{AD}(x, y) where {AD} =
+    (FakeDim{AD}(x), FakeDim{AD + ndims(x)}(y))
 
 Base.axes(id::FakeDim{N,S}) where {N,S} =
     (ntuple(_ -> Base.OneTo(1), Val(S - 1))..., axes(id.data)...)
 Base.size(id::FakeDim{N,S}) where {N,S} = (ntuple(_ -> 1, Val(S - 1))..., size(id.data)...)
 @inline extrude(x::FakeDim) = x
-# Specialize {N,N} to avoid allocation
-@inline newindex(::FakeDim{N,N}, I::CartesianIndex) where {N} =
-    CartesianIndex(ntuple(oneunit, Val(N - 1))..., I.I[N]...)
-@propagate_inbounds getindex(id::FakeDim{N,N}, I::Vararg{Int,N}) where {N} = id.data[I[N]]
-@inline newindex(::FakeDim{N,S}, I::CartesianIndex) where {N,S} =
-    CartesianIndex(ntuple(oneunit, Val(S - 1))..., I.I[S:N]...)
-@propagate_inbounds getindex(id::FakeDim{N,S}, I::Vararg{Int,N}) where {N,S} =
-    id.data[I[S:N]...]
-BroadcastStyle(::Type{ID}) where {ID<:FakeDim} =
+@inline newindex(::FakeDim{N,S}, I::CartesianIndex) where {N,S} = I.I[S:N]
+@propagate_inbounds getindex(id::FakeDim, I::NTuple{N,Int}) where {N} = id.data[I...]
+@inline BroadcastStyle(::Type{ID}) where {ID<:FakeDim} =
     ID.parameters[4] <: Tuple ? DefaultArrayStyle{ID.parameters[1]}() :
                                 BroadcastStyle(ID.parameters[4])
 
@@ -120,18 +122,11 @@ Base.size(l::Lazy) = size(l.ori)
 @inline Base.collect(l::Lazy) = collect(l.ori)
 @inline Base.iterate(l::Lazy, args...) = iterate(l.ori, args...)
 
-@inline broadcastable(l::Lazy) = lazycollect(l.ori)
-@inline lazycollect(x) = broadcastable(x)
-@inline lazycollect(g::Base.Generator) = broadcasted(g.f, Lazy(g.iter)) |> instantiate
-@inline lazycollect(i::Iterators.ProductIterator) = begin
-    iters = i.iterators
-    broadcasted(tuple, fakedims(iters...)...) |> instantiate
-end
-@inline fakedims(x, args...) = fakedims(Val(0), x, args...)
-@inline fakedims(::Val{N}, x, args...) where {N} =
-    (FakeDim{N}(lazycollect(x)), fakedims(Val(N + ndims(x)), args...)...)
-@inline fakedims(::Val{N}) where {N} = ()
-
+broadcastable(l::Lazy) = lazy(l.ori)
+@inline lazy(x) = broadcastable(x)
+@inline lazy(g::Base.Generator) = broadcasted(g.f, lazy(g.iter))
+@inline lazy(i::Iterators.ProductIterator) =
+    broadcasted(tuple, FakeDim{0}(i.iterators...)...) |> instantiate
 end
 using .LazyCollect
 ## better each
@@ -222,7 +217,7 @@ function copyto_unaliased!(::IndexCartesian, dest::AbstractArray, ::IndexLinear,
         end
     else
         # use zip based interator
-        for (I, J) in zip(eachindex(src), iter) 
+        for (I, J) in zip(eachindex(src), iter)
             @inbounds dest[J] = src[I]
         end
     end
@@ -254,7 +249,7 @@ function copyto_unaliased!(::IndexCartesian, dest::AbstractArray, ::IndexCartesi
             end
         end
     else
-        for (J, I) in zip(iterdest, itersrc) 
+        for (J, I) in zip(iterdest, itersrc)
             @inbounds dest[J] = src[I]
         end
     end

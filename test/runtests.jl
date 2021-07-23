@@ -19,6 +19,12 @@ end
     @test (a .+ 1) == b
 end
 
+@testset "@mtb for small array" begin
+    a = [1]
+    @mtb 2 a .+= 1
+    @test a[1] == 2
+end
+
 @testset "@mtb for BitArray" begin
     a = randn(4096 * 6 - 2048)
     b = a .> 0

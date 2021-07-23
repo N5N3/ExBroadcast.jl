@@ -1,6 +1,6 @@
 using Preferences
 function get_provider()
-    default_provider = "Threads"
+    default_provider = "Polyester"
 
     # Load the preference
     provider = @load_preference("provider", default_provider)
